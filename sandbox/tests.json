@@ -1,0 +1,3 @@
+[
+  {"glob": "**/*.sh", "cmd": "shellcheck '{file}'", "cd": true}
+]

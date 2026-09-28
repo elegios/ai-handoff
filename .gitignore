@@ -1,0 +1,5 @@
+/sandbox/*
+!/sandobx/AGENTS.md
+!/sandobx/handoff_monitor.py
+!/sandobx/tests.json
+!/sandobx/write_return.py

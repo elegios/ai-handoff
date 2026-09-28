@@ -1,0 +1,215 @@
+#!/usr/bin/env fish
+
+# === Parse options ===
+
+set -l options (fish_opt -l directory -r)
+set -a options (fish_opt -l ack-timeout-ms -r)
+set -a options (fish_opt -l answer-timeout-ms -r)
+argparse $options -- $argv
+or return 64
+
+if not set -q _flag_directory
+    echo "handoff: --directory is required" >&2
+    return 64
+end
+
+if test (count $argv) -ne 1
+    echo "handoff: expected exactly one <file> argument, got "(count $argv) >&2
+    return 64
+end
+
+set -g directory (path resolve $_flag_directory)
+set -g file (path resolve -- $argv[1])
+
+set -g ack_timeout_ms 2000
+if set -q _flag_ack_timeout_ms
+    set ack_timeout_ms $_flag_ack_timeout_ms
+end
+
+set -g answer_timeout_ms -1 # -1 = infinite
+if set -q _flag_answer_timeout_ms
+    set answer_timeout_ms $_flag_answer_timeout_ms
+end
+
+
+# === Functions communicating with the sandbox ===
+
+function handoff --argument-names file
+    __handoff_run $directory $file $ack_timeout_ms $answer_timeout_ms
+end
+
+function __handoff_stat_key --argument-names path
+    if not test -e $path
+        echo ''
+        return
+    end
+    # mtime:inode as a cheap "has this path been (re)written" fingerprint;
+    # tries GNU stat syntax, then falls back to BSD/macOS syntax.
+    set -l key (command stat -c '%Y:%i' $path 2>/dev/null)
+    if test -z "$key"
+        set key (command stat -f '%m:%i' $path 2>/dev/null)
+    end
+    echo $key
+end
+
+function __handoff_run --argument-names directory message ack_timeout_ms answer_timeout_ms
+    set -l ackfile "$directory/handoff.ack"
+    set -l returnfile "$directory/handoff.return"
+
+    # Snapshot before writing the request so a stale leftover file can't be
+    # mistaken for a fresh ACK/response.
+    set -l prev_ack_key (__handoff_stat_key $ackfile)
+    set -l prev_return_key (__handoff_stat_key $returnfile)
+
+    set -l tmpfile (command mktemp "$directory/.handoff.tmp.XXXXXX")
+    printf '%s' "CMD: $message" >$tmpfile
+    command mv $tmpfile "$directory/handoff"
+
+    set -l elapsed_ms 0
+    while true
+        set -l key (__handoff_stat_key $ackfile)
+        if test "$key" != "$prev_ack_key"; and test -e $ackfile
+            set -l content (string collect <$ackfile)
+            if test "$content" = "ACK"
+                break
+            end
+        end
+        if test $elapsed_ms -ge $ack_timeout_ms
+            echo "handoff: timed out after "$ack_timeout_ms"ms waiting for ACK on '$ackfile'" >&2
+            return 2
+        end
+        command sleep 0.05
+        set elapsed_ms (math $elapsed_ms + 50)
+    end
+
+    set -l elapsed_ms 0
+    while true
+        set -l key (__handoff_stat_key $returnfile)
+        if test "$key" != "$prev_return_key"
+            break
+        end
+        if test $answer_timeout_ms -ge 0; and test $elapsed_ms -ge $answer_timeout_ms
+            echo "handoff: timed out after "$answer_timeout_ms"ms waiting for response on '"$returnfile"'" >&2
+            return 2
+        end
+        command sleep 0.05
+        set elapsed_ms (math $elapsed_ms + 50)
+    end
+
+    cat $returnfile
+end
+
+
+# === Functions working with the jj repository ===
+
+function jjOrAbort
+  set -l errfile (command mktemp)
+  # stdout is intentionally left unredirected so it flows through to the
+  # caller's own capture; only stderr is captured, for the failure message.
+  command jj $argv 2>$errfile
+  set -l rc $status
+  if test $rc -ne 0
+    echo "handoff: jj command failed" >&2
+    echo "    cmd:" (string join ' ' -- (string escape -- jj $argv)) >&2
+    echo " output:" >&2
+    cat $errfile >&2
+    command rm -f $errfile
+    exit 1
+  end
+  command rm -f $errfile
+end
+
+function ensureHandoffWorkspace --argument-names directory
+    if set -l root (jj workspace root --name handoff 2>/dev/null)
+        # workspace exists, check it's in an appropriate location
+        if not string match --quiet --regex --entire '^'(string escape --style regex -- $directory) -- (path resolve -- $root)
+            echo "handoff: the 'handoff' workspace ($root) is not located within the handoff directory ($directory)." >&2
+            exit 1
+        end
+    else if not set -l error (jj workspace add --name handoff $directory/(path basename (jj root)) 2>&1)
+        echo "handoff: could not create 'handoff' workspace:" \n$error >&2
+        exit 1
+    end
+    jj workspace root --name handoff
+end
+
+function jjGetCurrRev
+    jjOrAbort $argv log --revision @ --template 'change_id' --no-graph
+end
+
+function jjEditedFiles
+    path resolve -- (jjOrAbort $argv show @ --name-only --template '')
+end
+
+function jjGetCurrOp
+    jjOrAbort op log --limit 1 --template 'id' --no-graph
+end
+
+function jjConflictedFiles --argument-names rev
+    jjOrAbort log --revision $rev --no-graph --template 'self.conflicted_files().map(|f| f.path()).join("\n")'
+end
+
+function jjAbort --argument-names code workspace origRev localRev wsRev
+    jjOrAbort --repository $workspace abandon $wsRev >/dev/null
+    jjOrAbort squash --revision $localRev >/dev/null
+    jjOrAbort edit $origRev >/dev/null
+    echo "handoff: aborted, temporary revisions removed." >&2
+    exit $code
+end
+
+
+# === The actual script that does stuff ===
+
+set -l root (jjOrAbort root)
+set -l localFilePath (realpath --relative-to $root $file)
+
+set -g lockfile "$directory/handoff.lock"
+# ln -s is an atomic exclusive-create (symlink(2) fails with EEXIST),
+# unlike `> file`, which fish has no noclobber option to guard.
+if not command ln -s $fish_pid $lockfile 2>/dev/null
+    echo "handoff: lock '$lockfile' already exists; another handoff appears to be in progress" >&2
+    exit 2
+end
+
+function __releaseHandoffLock --on-event fish_exit
+    command rm -f $lockfile
+end
+
+set -l workspace (ensureHandoffWorkspace $directory)
+
+set -l origRev (jjGetCurrRev)
+jjOrAbort --repository $workspace workspace update-stale >/dev/null
+jjOrAbort --repository $workspace new $origRev >/dev/null
+set -l wsRev (jjGetCurrRev --repository $workspace)
+jjOrAbort new $origRev >/dev/null
+set -l localRev (jjGetCurrRev)
+
+set -l result (handoff $workspace/$localFilePath)
+or jjAbort 2 $workspace $origRev $localRev $wsRev
+
+set -l extraFiles (string match --invert (path resolve -- $workspace/$localFilePath) -- (jjEditedFiles --repository $workspace))
+set -l opId (jjGetCurrOp --repository $workspace)
+
+# Wait for driver to report ready before doing things
+echo "Edit ready."
+switch (read --prompt-str " Apply? [Y/n]: ")
+case y Y ''
+case n N '*'
+    jjAbort 3 $workspace $origRev $localRev $wsRev
+end
+
+jjOrAbort squash --revision $wsRev >/dev/null
+jjOrAbort squash --revision $localRev >/dev/null
+jjOrAbort edit $origRev >/dev/null
+
+set -l conflictFiles $root/(jjConflictedFiles $origRev)
+
+if set -q extraFiles[1]
+    set extraFiles $root/(realpath --relative-to $workspace $extraFiles)
+end
+set -l extraFiles (string join0 -- $extraFiles | jq --raw-input --slurp --compact-output 'split("\u0000")[:-1]')
+set -l conflictFiles (string join0 -- $conflictFiles | jq --raw-input --slurp --compact-output 'split("\u0000")[:-1]')
+set -l opId (string join \n -- $opId | jq --raw-input '.')
+set -l wsRev (string join \n -- $wsRev | jq --raw-input '.')
+
+string join \n $result | jq --compact-output ".extraFiles = $extraFiles | .conflictFiles = $conflictFiles | .opId = $opId | .rev = $wsRev"
