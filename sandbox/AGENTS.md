@@ -46,8 +46,9 @@ Each command names one file (an absolute or cwd-relative path):
    ```
 
    Fields: `todos_found`, `todos_fixed`, `tests_run`, `tests_pass` are
-   integers. `info` is free text — leave it `""` unless a TODO couldn't
-   be completed or something about the change is worth flagging.
+   integers. `info` is free text and should almost always be
+   empty. Only put text there if a TODO couldn't be finished or
+   something about the change is worth flagging.
 
 ## tests.json format
 
