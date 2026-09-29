@@ -23,7 +23,7 @@
   :type '(choice (const :tag "Unset" nil) directory))
 
 (defcustom ai/handoff-program nil
-  "Path to the `handoff' script.  If nil, look for `handoff' on `exec-path'."
+  "Path to the `handoff' script.  If nil, look for `handoff' above `ai/handoff-directory', or on `exec-path'."
   :type '(choice (const :tag "Search exec-path" nil) file))
 
 (defcustom ai/handoff-idle-seconds 5
@@ -58,6 +58,8 @@
 
 (defun ai/handoff--program ()
   (or ai/handoff-program
+      (let ((candidate (expand-file-name "../handoff" ai/handoff-directory)))
+        (and (file-executable-p candidate) candidate))
       (executable-find "handoff")
       (user-error "Could not find `handoff'; set `ai/handoff-program'")))
 
